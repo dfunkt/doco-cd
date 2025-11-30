@@ -21,7 +21,26 @@ type EnvVarFileMapping struct {
 	AllowUnset bool    // AllowUnset indicates if both the fileField and value can be unset
 }
 
+// determineFormatFromContent attempts to determine the file format from the content.
+func determineFormatFromContent(content string) string {
+	trimmed := strings.TrimSpace(content)
+
+	switch {
+	case strings.HasPrefix(trimmed, "{") && strings.Contains(trimmed, "suffix"):
+		return "json"
+	case strings.HasPrefix(trimmed, "---") || strings.Contains(trimmed, "\n- "):
+		return "yaml"
+	case strings.HasPrefix(trimmed, "["):
+		return "ini"
+	case strings.Contains(trimmed, "=") && !strings.Contains(trimmed, "{"):
+		return "dotenv"
+	default:
+		return "binary"
+	}
+}
+
 // LoadFileBasedEnvVars loads env-based config values from file-based env vars if set.
+// Now supports SOPS-encrypted files using the existing encryption package.
 func LoadFileBasedEnvVars(mappings *[]EnvVarFileMapping) error {
 	for _, m := range *mappings {
 		fileSet := m.FileValue != nil && *m.FileValue != ""
@@ -32,7 +51,30 @@ func LoadFileBasedEnvVars(mappings *[]EnvVarFileMapping) error {
 				return fmt.Errorf("%w: %s or %s", ErrBothSecretsSet, m.EnvName, m.EnvName+"_FILE")
 			}
 
-			*m.EnvValue = strings.TrimSpace(*m.FileValue)
+			// The env library's "file" tag has already read the file content into FileValue
+			// Now we need to check if it's SOPS-encrypted content or plaintext
+			fileContent := *m.FileValue
+
+			var content string
+
+			if encryption.IsEncryptedContent(fileContent) {
+				// FileValue contains SOPS-encrypted content directly
+				// Determine the format from content characteristics
+				format := determineFormatFromContent(fileContent)
+
+				decryptedBytes, err := encryption.DecryptContent([]byte(fileContent), format)
+				if err != nil {
+					return fmt.Errorf("failed to decrypt %s_FILE content: %w", m.EnvName, err)
+				}
+
+				content = string(decryptedBytes)
+			} else {
+				// FileValue contains the actual file content (plaintext) from the file tag
+				content = fileContent
+			}
+
+			// Trim whitespace and set the value
+			*m.EnvValue = strings.TrimSpace(content)
 
 			continue
 		}
