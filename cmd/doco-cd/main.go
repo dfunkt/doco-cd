@@ -75,7 +75,50 @@ func CreateMountpointSymlink(m container.MountPoint) error {
 	return nil
 }
 
+func healthcheck() int {
+	// Get configuration for port and timeout
+	healthcheckURL := os.Getenv("HEALTHCHECK_URL")
+	if healthcheckURL == "" {
+		// Get the application configuration
+		c, err := config.GetAppConfig()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to get application configuration: %v\n", err)
+			return 1
+		}
+
+		healthcheckURL = fmt.Sprintf("http://localhost:%d%s", c.HttpPort, healthPath)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthcheckURL, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create request: %v\n", err)
+		return 1
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Healthcheck failed: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close() // nolint:errcheck
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "Unhealthy: HTTP %d\n", resp.StatusCode)
+		return 1
+	}
+
+	return 0
+}
+
 func main() {
+	// Check if healthcheck command is requested
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		os.Exit(healthcheck())
+	}
+
 	ctx := context.Background()
 
 	var wg sync.WaitGroup
