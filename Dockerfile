@@ -47,7 +47,6 @@ WORKDIR /
 VOLUME /data
 
 COPY --from=build /doco-cd /doco-cd
-COPY --from=busybox-binaries /bin/wget /usr/bin/wget
 
 ENV TZ=UTC \
     HTTP_PORT=80 \
@@ -57,4 +56,4 @@ ENV TZ=UTC \
 ENTRYPOINT ["/doco-cd"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD ["/usr/bin/wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80/v1/health"]
+  CMD ["/doco-cd", "healthcheck"]
