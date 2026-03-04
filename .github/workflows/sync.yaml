@@ -1,0 +1,79 @@
+name: Sync Fork with Upstream
+on:
+  workflow_dispatch:
+
+env:
+  SOURCE_REPO: "kimdre/doco-cd"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Generate GitHub App Token
+        id: generate_token
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2.2.1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          token: ${{ steps.generate_token.outputs.token }}
+
+      - name: Get latest upstream release
+        id: check
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          LATEST_TAG=$(gh release list \
+            --repo "${SOURCE_REPO}" \
+            --limit 1 \
+            --json tagName,isPrerelease \
+            --jq '.[] | select(.isPrerelease == false) | .tagName')
+
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "Latest upstream release: $LATEST_TAG"
+
+          if git rev-parse "$LATEST_TAG" >/dev/null 2>&1; then
+            echo "has_new=false" >> $GITHUB_OUTPUT
+            echo "Release $LATEST_TAG already exists locally"
+          else
+            echo "has_new=true" >> $GITHUB_OUTPUT
+            echo "New release $LATEST_TAG found!"
+          fi
+
+      - name: Sync and open PR
+        if: steps.check.outputs.has_new == 'true'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+          TAG: ${{ steps.check.outputs.latest_tag }}
+        run: |
+          BRANCH="sync-upstream-${TAG}"
+
+          # Bail out if a PR already exists for this branch
+          EXISTING_PR=$(gh pr list \
+            --repo "${{ github.repository }}" \
+            --head "$BRANCH" \
+            --json number \
+            --jq 'length')
+          if [ "$EXISTING_PR" -gt 0 ]; then
+            echo "PR already exists for $BRANCH, skipping."
+            exit 0
+          fi
+
+          git remote add upstream "https://github.com/${SOURCE_REPO}.git"
+          git fetch upstream
+
+          git checkout -b "$BRANCH" "$TAG"
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --repo "${{ github.repository }}" \
+            --title "Sync with upstream release ${TAG}" \
+            --body "Auto-sync with upstream release \`${TAG}\` from [\`${SOURCE_REPO}\`](https://github.com/${SOURCE_REPO})." \
+            --head "$BRANCH"
