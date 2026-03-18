@@ -13,7 +13,6 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 
 	"github.com/kimdre/doco-cd/internal/config"
-	"github.com/kimdre/doco-cd/internal/encryption"
 	"github.com/kimdre/doco-cd/internal/logger"
 
 	"github.com/kimdre/doco-cd/internal/utils/set"
@@ -141,16 +140,6 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 			return fmt.Errorf("failed to check for default compose files: %w", err)
 		}
 
-		// Decrypt any SOPS-encrypted files in the working directory
-		f, err := encryption.DecryptFilesInDirectory(s.Repository.PathInternal, intAbsWorkingDir)
-		if err != nil {
-			return fmt.Errorf("file decryption failed: %w", err)
-		}
-
-		if len(f) > 0 {
-			s.Log.Debug("decrypted SOPS-encrypted files", slog.Any("files", f))
-		}
-
 		// Create a temporary env file if environment variables are specified in the deployment config
 		if s.DeployConfig.Internal.Environment != nil {
 			tmpEnvFile, err := config.CreateTmpDotEnvFile(s.DeployConfig)
@@ -169,7 +158,7 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 		}
 
 		s.Docker.Project, err = docker.LoadCompose(
-			ctx, extAbsWorkingDir, s.DeployConfig.Name,
+			ctx, s.Repository.PathExternal, extAbsWorkingDir, s.DeployConfig.Name,
 			s.DeployConfig.ComposeFiles, s.DeployConfig.EnvFiles,
 			s.DeployConfig.Profiles, s.DeployState.ResolvedSecrets)
 		if err != nil {
@@ -186,7 +175,7 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 			stageLog.Debug("compose project has changed, proceeding with deployment", slog.String("new_hash", newHash), slog.String("old_hash", curProjectHash))
 		}
 
-		changedFiles, err := docker.ProjectFilesHaveChanges(s.DeployState.ChangedFiles, s.Docker.Project)
+		changedFiles, err := docker.ProjectFilesHaveChanges(s.Repository.PathExternal, s.DeployState.ChangedFiles, s.Docker.Project)
 		if err != nil {
 			return fmt.Errorf("failed to check for changed project files: %s", err)
 		}

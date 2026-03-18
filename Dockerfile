@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1@sha256:b6afd42430b15f2d2a4c5a02b919e98a525b785b1aaff16747d2f623364e39b6
+# syntax=docker/dockerfile:1@sha256:4a43a54dd1fedceb30ba47e76cfcf2b47304f4161c0caeac2db1c61804ea3c91
 FROM golang:1.26.1@sha256:c7e98cc0fd4dfb71ee7465fee6c9a5f079163307e4bf141b336bb9dae00159a5 AS prerequisites
 
 ARG APP_VERSION=dev
@@ -26,8 +26,7 @@ RUN if [ "$DISABLE_BITWARDEN" != "true" ] && ! ([ "$TARGETARCH" = "arm" ] && [ "
 ENV GOCACHE=/root/.cache/go-build \
     GOOS=linux
 
-# Copy source code
-COPY . ./
+COPY go.mod go.sum ./
 
 RUN --mount=type=cache,target=/go/pkg/mod/ \
     --mount=type=bind,source=go.sum,target=go.sum \
@@ -42,6 +41,8 @@ ARG DISABLE_BITWARDEN=false
 ARG BW_SDK_BUILD_FLAGS="-linkmode external -extldflags '-static -Wl,-unresolved-symbols=ignore-all'"
 ARG TARGETARCH
 ARG TARGETVARIANT
+
+COPY . .
 
 # Build with or without Bitwarden support
 # armv7 builds are automatically built without Bitwarden

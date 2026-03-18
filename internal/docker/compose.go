@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kimdre/doco-cd/internal/encryption"
 	"github.com/kimdre/doco-cd/internal/utils/module"
 
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
@@ -164,7 +165,9 @@ func addComposeVolumeLabels(project *types.Project, deployConfig *config.DeployC
 }
 
 // LoadCompose parses and loads Compose files as specified by the Docker Compose specification.
-func LoadCompose(ctx context.Context, workingDir, projectName string, composeFiles, envFiles, profiles []string, environment map[string]string) (*types.Project, error) {
+func LoadCompose(ctx context.Context, repoPath, workingDir, projectName string, composeFiles,
+	envFiles, profiles []string, environment map[string]string,
+) (*types.Project, error) {
 	// Resolve compose file paths to absolute paths relative to workingDir.
 	// This is necessary because the compose-go library's LoadConfigFiles internally
 	// uses filepath.Abs which resolves relative paths against os.Getwd(), not against
@@ -214,6 +217,20 @@ func LoadCompose(ctx context.Context, workingDir, projectName string, composeFil
 		}
 	}
 
+	var decryptedFiles []string
+
+	decryptFiles := slices.Concat(absComposeFiles, absEnvFiles)
+	for _, file := range decryptFiles {
+		decrypted, err := encryption.DecryptFileInPlace(file, repoPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt file %s: %w", file, err)
+		}
+
+		if decrypted {
+			decryptedFiles = append(decryptedFiles, file)
+		}
+	}
+
 	options, err := cli.NewProjectOptions(
 		absComposeFiles,
 		cli.WithName(projectName),
@@ -251,7 +268,25 @@ func LoadCompose(ctx context.Context, workingDir, projectName string, composeFil
 		return nil, fmt.Errorf("failed to get .env file for interpolation: %w", err)
 	}
 
+	// Preload project for decrypting project-related files
 	project, err := options.LoadProject(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load compose project: %w", err)
+	}
+
+	// Decrypt any project-related files
+	files, err := DecryptProjectFiles(repoPath, project)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt project files: %w", err)
+	}
+
+	decryptedFiles = append(decryptedFiles, files...)
+	if len(decryptedFiles) > 0 {
+		slog.Debug("decrypted SOPS-encrypted files", slog.String("stack", project.Name), slog.Any("files", decryptedFiles))
+	}
+
+	// Reload project after decryption to ensure all decrypted values are properly loaded into the project.
+	project, err = options.LoadProject(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load compose project: %w", err)
 	}
@@ -418,10 +453,9 @@ func DeployStack(
 		}(tmpEnvFile)
 	}
 
-	project, err := LoadCompose(*ctx, externalWorkingDir, deployConfig.Name, deployConfig.ComposeFiles, deployConfig.EnvFiles, deployConfig.Profiles, resolvedSecrets)
+	project, err := LoadCompose(*ctx, externalRepoPath, externalWorkingDir, deployConfig.Name, deployConfig.ComposeFiles, deployConfig.EnvFiles, deployConfig.Profiles, resolvedSecrets)
 	if err != nil {
-		errMsg := "failed to load compose config"
-		return fmt.Errorf("%s: %w", errMsg, err)
+		return fmt.Errorf("failed to load compose config: %w", err)
 	}
 
 	done := make(chan struct{})
@@ -504,7 +538,7 @@ func DeployStack(
 			}
 		}
 	} else {
-		detectedChanges, err := ProjectFilesHaveChanges(changedFiles, project)
+		detectedChanges, err := ProjectFilesHaveChanges(externalRepoPath, changedFiles, project)
 		if err != nil {
 			errMsg := "failed to check for changed project files"
 			return fmt.Errorf("%s: %w", errMsg, err)
@@ -536,10 +570,7 @@ func DeployStack(
 		err = deployCompose(*ctx, *dockerCli, project, deployConfig, recreateMode, forcedServices.ToSlice())
 		if err != nil {
 			prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
-
-			errMsg := "failed to deploy stack"
-
-			return fmt.Errorf("%s: %w", errMsg, err)
+			return fmt.Errorf("failed to deploy stack: %w", err)
 		}
 	}
 
@@ -611,39 +642,54 @@ func getPaths(changedFiles []gitInternal.ChangedFile, basePath string) []string 
 				p = filepath.Join(basePath, p)
 			}
 
-			if !slices.Contains(absPaths, p) {
-				absPaths = append(absPaths, p)
-			}
+			absPaths = append(absPaths, p)
 		}
 	}
 
-	return absPaths
+	return slice.Unique(absPaths)
+}
+
+// checkPathAffected checks if a changed file is affected by a used file.
+func checkPathAffected(changed string, used string) bool {
+	used = filepath.Clean(used)
+	changed = filepath.Clean(changed)
+
+	rel, err := filepath.Rel(used, changed)
+	if err != nil {
+		// It' share same reporoot, so it should not happen
+		slog.Debug("checkPathAffected ",
+			slog.String("used", used),
+			slog.String("changed", changed),
+			slog.Any("error", err),
+		)
+
+		return false
+	}
+
+	return !strings.HasPrefix(rel, "..")
 }
 
 // HasChangedConfigs checks if any files used in docker compose `configs:` definitions have changed using the Git status.
-func HasChangedConfigs(changedFiles []gitInternal.ChangedFile, project *types.Project) ([]string, error) {
-	// We only need the relative part in this case
-	paths := getPaths(changedFiles, ".")
+func HasChangedConfigs(paths []string, project *types.Project) ([]string, error) {
+	configToServicesMap := make(map[string][]string)
+
+	for name, s := range project.Services {
+		for _, cfg := range s.Configs {
+			configToServicesMap[cfg.Source] = append(configToServicesMap[cfg.Source], name)
+		}
+	}
 
 	var changedServices []string
 
-	for _, c := range project.Configs {
+	for name, c := range project.Configs {
 		// Changes in config.Content are handled in project hash comparison
 		if c.File == "" {
 			continue
 		}
 
 		for _, p := range paths {
-			if strings.HasSuffix(c.File, p) {
-				// Find services that use if the changed config
-				for _, s := range project.Services {
-					for _, cfg := range s.Configs {
-						if strings.HasSuffix(c.File, cfg.Source) {
-							changedServices = append(changedServices, s.Name)
-							break
-						}
-					}
-				}
+			if checkPathAffected(p, c.File) {
+				changedServices = append(changedServices, configToServicesMap[name]...)
 			}
 		}
 	}
@@ -652,28 +698,25 @@ func HasChangedConfigs(changedFiles []gitInternal.ChangedFile, project *types.Pr
 }
 
 // HasChangedSecrets checks if any files used in docker compose `secrets:` definitions have changed using the Git status.
-func HasChangedSecrets(changedFiles []gitInternal.ChangedFile, project *types.Project) ([]string, error) {
-	// We only need the relative part in this case
-	paths := getPaths(changedFiles, ".")
+func HasChangedSecrets(paths []string, project *types.Project) ([]string, error) {
+	secretsToServicesMap := make(map[string][]string)
+
+	for name, s := range project.Services {
+		for _, secret := range s.Secrets {
+			secretsToServicesMap[secret.Source] = append(secretsToServicesMap[secret.Source], name)
+		}
+	}
 
 	var changedServices []string
 
-	for _, s := range project.Secrets {
+	for name, s := range project.Secrets {
 		if s.File == "" {
 			continue
 		}
 
 		for _, p := range paths {
-			if strings.HasSuffix(s.File, p) {
-				// Find services that use if the changed config
-				for _, svc := range project.Services {
-					for _, secret := range svc.Secrets {
-						if strings.HasSuffix(s.File, secret.Source) {
-							changedServices = append(changedServices, svc.Name)
-							break
-						}
-					}
-				}
+			if checkPathAffected(p, s.File) {
+				changedServices = append(changedServices, secretsToServicesMap[name]...)
 			}
 		}
 	}
@@ -682,24 +725,17 @@ func HasChangedSecrets(changedFiles []gitInternal.ChangedFile, project *types.Pr
 }
 
 // HasChangedBindMounts checks if any files used in docker compose `volumes:` definitions with type `bind` have changed using the Git status.
-func HasChangedBindMounts(changedFiles []gitInternal.ChangedFile, project *types.Project) ([]string, error) {
-	paths := getPaths(changedFiles, ".")
-
+func HasChangedBindMounts(paths []string, project *types.Project) ([]string, error) {
 	var changedServices []string
 
 	for _, s := range project.Services {
+	out:
 		for _, v := range s.Volumes {
 			if v.Type == "bind" && v.Source != "" {
-				bindSourceAbs := v.Source
-
-				if filesInPath(paths, bindSourceAbs) {
-					for _, svc := range project.Services {
-						for _, vol := range svc.Volumes {
-							if vol.Type == "bind" && vol.Source == v.Source {
-								changedServices = append(changedServices, svc.Name)
-								break
-							}
-						}
+				for _, p := range paths {
+					if checkPathAffected(p, v.Source) {
+						changedServices = append(changedServices, s.Name)
+						break out
 					}
 				}
 			}
@@ -710,25 +746,16 @@ func HasChangedBindMounts(changedFiles []gitInternal.ChangedFile, project *types
 }
 
 // HasChangedEnvFiles checks if any files used in docker compose `env_file:` definitions have changed using the Git status.
-func HasChangedEnvFiles(changedFiles []gitInternal.ChangedFile, project *types.Project) ([]string, error) {
-	// We only need the relative part in this case
-	paths := getPaths(changedFiles, ".")
-
+func HasChangedEnvFiles(paths []string, project *types.Project) ([]string, error) {
 	var changedServices []string
 
 	for _, s := range project.Services {
+	out:
 		for _, envFile := range s.EnvFiles {
 			for _, p := range paths {
-				if strings.HasSuffix(envFile.Path, p) {
-					// Find services that use if the changed env file
-					for _, svc := range project.Services {
-						for _, ef := range svc.EnvFiles {
-							if strings.HasSuffix(envFile.Path, ef.Path) {
-								changedServices = append(changedServices, svc.Name)
-								break
-							}
-						}
-					}
+				if checkPathAffected(p, envFile.Path) {
+					changedServices = append(changedServices, s.Name)
+					break out
 				}
 			}
 		}
@@ -739,9 +766,7 @@ func HasChangedEnvFiles(changedFiles []gitInternal.ChangedFile, project *types.P
 
 // HasChangedBuildFiles checks if any files used as build context in docker compose `build:` definitions have changed using the Git status.
 // This includes any file within the build context directory for each service. If a changed file is within a build context, it returns true.
-func HasChangedBuildFiles(changedFiles []gitInternal.ChangedFile, project *types.Project) ([]string, error) {
-	paths := getPaths(changedFiles, ".")
-
+func HasChangedBuildFiles(paths []string, project *types.Project) ([]string, error) {
 	var changedServices []string
 
 	for _, s := range project.Services {
@@ -780,15 +805,17 @@ func HasChangedBuildFiles(changedFiles []gitInternal.ChangedFile, project *types
 			contexts = append(contexts, dockerFile)
 		}
 
+	out:
+
 		for _, ctxFile := range contexts {
 			if !path.IsAbs(ctxFile) {
 				ctxFile = filepath.Join(project.WorkingDir, ctxFile)
 			}
 
 			for _, p := range paths {
-				if strings.HasSuffix(ctxFile, p) {
+				if checkPathAffected(p, ctxFile) {
 					changedServices = append(changedServices, s.Name)
-					break
+					break out
 				}
 			}
 		}
@@ -814,10 +841,10 @@ func sortChanges(changes []Change) {
 }
 
 // ProjectFilesHaveChanges checks if any files related to the compose project have changed.
-func ProjectFilesHaveChanges(changedFiles []gitInternal.ChangedFile, project *types.Project) ([]Change, error) {
+func ProjectFilesHaveChanges(repoRootExternal string, changedFiles []gitInternal.ChangedFile, project *types.Project) ([]Change, error) {
 	checks := []struct {
 		name string
-		fn   func([]gitInternal.ChangedFile, *types.Project) ([]string, error)
+		fn   func([]string, *types.Project) ([]string, error)
 	}{
 		{"configs", HasChangedConfigs},
 		{"secrets", HasChangedSecrets},
@@ -826,10 +853,12 @@ func ProjectFilesHaveChanges(changedFiles []gitInternal.ChangedFile, project *ty
 		{"buildFiles", HasChangedBuildFiles},
 	}
 
+	paths := getPaths(changedFiles, repoRootExternal)
+
 	var changes []Change
 
 	for _, check := range checks {
-		changedServices, err := check.fn(changedFiles, project)
+		changedServices, err := check.fn(paths, project)
 		if err != nil {
 			return nil, fmt.Errorf("failed to check '%s' for changes: %w", check.name, err)
 		}
@@ -1043,54 +1072,94 @@ func CheckDefaultComposeFiles(composeFiles []string, workingDir string) ([]strin
 	return composeFiles, nil
 }
 
-// filesInPath checks if at least one of the given filePaths is inside the searchPath.
-func filesInPath(filePaths []string, searchPath string) bool {
-	for _, p := range filePaths {
-		if strings.HasSuffix(p, filepath.Base(searchPath)) {
-			p = joinPathsWithoutDuplicates(searchPath, p)
-		}
+// DecryptProjectFiles decrypts all files used in the compose project that are encrypted using doco-cd's encryption mechanism.
+// This includes configs, secrets, bind mounts, env files and build contexts.
+// Since absolute file paths in types.Project are paths on the docker host, repoPath also needs to be the external path to the repository.
+// We use the symlink inside the container to follow the external path to the correct internal path.
+func DecryptProjectFiles(repoPath string, p *types.Project) ([]string, error) {
+	var (
+		projectFiles   []string
+		decryptedFiles []string
+	)
 
-		rel, err := filepath.Rel(searchPath, p)
-		if err != nil {
-			continue
-		}
-
-		if !strings.HasPrefix(rel, "..") {
-			return true
-		}
-	}
-
-	return false
-}
-
-// joinPathsWithoutDuplicates joins multiple paths, removing duplicate overlapping segments between each pair.
-func joinPathsWithoutDuplicates(paths ...string) string {
-	if len(paths) == 0 {
-		return ""
-	}
-
-	isAbs := filepath.IsAbs(paths[0])
-
-	resultElems := strings.Split(filepath.Clean(paths[0]), string(filepath.Separator))
-	for _, next := range paths[1:] {
-		nextElems := strings.Split(filepath.Clean(next), string(filepath.Separator))
-		maxOverlap := 0
-
-		m := min(len(resultElems), len(nextElems))
-		for k := m; k > 0; k-- {
-			if reflect.DeepEqual(resultElems[len(resultElems)-k:], nextElems[:k]) {
-				maxOverlap = k
-				break
+	for _, s := range p.Services {
+		for _, cfg := range s.Configs {
+			if cfg.Source != "" {
+				projectFiles = append(projectFiles, cfg.Source)
 			}
 		}
 
-		resultElems = append(resultElems, nextElems[maxOverlap:]...)
+		for _, secret := range s.Secrets {
+			if secret.Source != "" {
+				projectFiles = append(projectFiles, secret.Source)
+			}
+		}
+
+		for _, v := range s.Volumes {
+			if v.Type == "bind" && v.Source != "" {
+				info, err := os.Stat(v.Source)
+				if err != nil {
+					if errors.Is(err, os.ErrNotExist) {
+						continue
+					}
+
+					return decryptedFiles, fmt.Errorf("failed to stat bind mount source '%s': %w", v.Source, err)
+				}
+
+				if info.IsDir() {
+					decryptedFiles, err = encryption.DecryptFilesInDirectory(repoPath, v.Source)
+					if err != nil {
+						return decryptedFiles, fmt.Errorf("failed to decrypt files in bind mount directory '%s': %w", v.Source, err)
+					}
+
+					continue
+				}
+
+				projectFiles = append(projectFiles, v.Source)
+			}
+		}
+
+		for _, envFile := range s.EnvFiles {
+			if envFile.Path != "" {
+				projectFiles = append(projectFiles, envFile.Path)
+			}
+		}
+
+		if s.Build != nil {
+			if s.Build.Dockerfile != "" {
+				if filepath.IsAbs(s.Build.Dockerfile) {
+					projectFiles = append(projectFiles, s.Build.Dockerfile)
+				} else {
+					projectFiles = append(projectFiles, filepath.Join(s.Build.Context, s.Build.Dockerfile))
+				}
+			}
+
+			for _, secret := range s.Build.Secrets {
+				if secret.Source != "" {
+					if filepath.IsAbs(secret.Source) {
+						projectFiles = append(projectFiles, secret.Source)
+					} else {
+						projectFiles = append(projectFiles, filepath.Join(s.Build.Context, secret.Source))
+					}
+				}
+			}
+		}
 	}
 
-	joined := filepath.Join(resultElems...)
-	if isAbs && !strings.HasPrefix(joined, string(filepath.Separator)) {
-		joined = string(filepath.Separator) + joined
+	for _, f := range slice.Unique(projectFiles) {
+		if !filepath.IsAbs(f) {
+			f = filepath.Join(p.WorkingDir, f)
+		}
+
+		decrypted, err := encryption.DecryptFileInPlace(f, repoPath)
+		if err != nil {
+			return decryptedFiles, fmt.Errorf("failed to decrypt project file '%s': %w", f, err)
+		}
+
+		if decrypted {
+			decryptedFiles = append(decryptedFiles, f)
+		}
 	}
 
-	return joined
+	return decryptedFiles, nil
 }
